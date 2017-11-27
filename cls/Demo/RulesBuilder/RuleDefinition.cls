@@ -1,0 +1,340 @@
+Include %IKPublic
+
+Class Demo.RulesBuilder.RuleDefinition Extends %Persistent
+{
+
+Property DomainId As %Integer;
+
+Property Name As %String;
+
+Property Elements As list Of RuleDefinitionElement(STORAGEDEFAULT = "array");
+
+Property EnforceSequence As %Boolean [ InitialExpression = 0 ];
+
+Property MinimumScore As %Numeric [ InitialExpression = 0 ];
+
+Property StringRepresentation As %String [ Calculated, SqlComputeCode = { new o  set o = ##class(Demo.RulesBuilder.RuleDefinition).%OpenId({%%ID}), {*} = $s($isobject(o):o.StringRepresentationGet(), 1:"")}, SqlComputed ];
+
+Index NameIndex On (DomainId, Name);
+
+Method StringRepresentationGet() As %String [ Internal ]
+{
+	set tString = ""
+	for i = 1:1:..Elements.Count() {
+		set:i>1 tString = tString_" ~ "
+		set tElement = ..Elements.GetAt(i)
+		
+		set tString = tString_$case(tElement.Negation, "affirmative":"+", "negative":"-", "rule":"x", :"")
+		
+		if tElement.Type="dictionary" {
+			set tString = tString _ "{"_tElement.Name_"}"
+		} elseif tElement.Type="item" {
+			set tString = tString _ "["_tElement.Name_"]"
+		}
+		set tString = tString_$case(tElement.Count, 0:"?", 1:"", 2:"+", 3:"*", :"")
+	}
+	quit tString
+}
+
+/// Returns a filter that selects all sources containing the mandatory elements for this rule 
+/// and therefore having a high chance of matching it.
+Method GetFilter(Output pFilter As %iKnow.Filters.Filter) As %Status
+{
+	set tSC = $$$OK
+	try {
+		set tDomainId = ..DomainId
+		set pFilter = ##class(%iKnow.Filters.GroupFilter).%New(tDomainId, "AND")
+		
+		// AND all mandatory element filters
+		for i = 1:1:..Elements.Count() {
+			set tElement = ..Elements.GetAt(i)
+			continue:'tElement.Count
+			if (tElement.Type="dictionary") {
+				set tDictID = ##class(%iKnow.Matching.DictionaryAPI).GetDictionaryId(tDomainId, tElement.Name)
+				continue:'tDictID
+				set tFilter = ##class(%iKnow.Filters.DictionaryMatchFilter).%New(tDomainId, tDictID)
+			} elseif (tElement.Type="item") {
+				set tDictItemID = ##class(%iKnow.Matching.DictionaryAPI).GetDictionaryItemIdByURI(tDomainId, tElement.Name)
+				continue:'tDictItemID
+				set tFilter = ##class(%iKnow.Filters.DictionaryItemMatchFilter).%New(tDomainId, tDictItemID)
+			}
+			do pFilter.AddSubFilter(tFilter)
+		}
+	} catch (ex) {
+		set tSC = ex.AsStatus()
+	}
+	quit tSC
+}
+
+ClassMethod GetAllFilters(pDomainId As %Integer, Output pFilter As %iKnow.Filters.Filter) As %Status
+{
+	set tSC = $$$OK
+	try {
+		set tStatement = ##class(%SQL.Statement).%New()
+		set tSC = tStatement.%Prepare("SELECT ID FROM Demo_RulesBuilder.RuleDefinition WHERE DomainId = ?")
+		quit:$$$ISERR(tSC)
+		set pFilter = ##class(%iKnow.Filters.GroupFilter).%New(pDomainId, "OR")
+		set tResult = tStatement.%Execute(pDomainId) 
+		while tResult.%Next() {
+			set tSC = ..%OpenId(tResult.%Get("ID")).GetFilter(.tFilter)
+			quit:$$$ISERR(tSC)
+			do pFilter.AddSubFilter(tFilter)
+		}
+		quit:$$$ISERR(tSC)
+		
+	} catch (ex) {
+		set tSC = ex.AsStatus()
+	}
+	quit tSC
+}
+
+Method CheckMatches(pSrcId As %Integer, pParagraphId As %Integer = 0, pSentId As %Integer = 0) As %Status
+{
+	set tSC = $$$OK
+	try {
+		set vSrcId = $s(pSrcId<0:$zabs(pSrcId), 1:0)
+		
+		set tColors = $lb("Grey", "Tomato", "PaleGreen", "LightBlue", "Yellow", "HotPink", "Plum", "SandyBrown")
+		
+		set tTotalScore = 0
+		set tDocName = ##class(Demo.RulesBuilder.Utils).GetDocumentName(..DomainId, pSrcId)
+		set tExtractResult = ##class(ExtractionResult).%New()
+		set tExtractResult.DomainId = ..DomainId
+		set tExtractResult.DocumentName = tDocName
+		set tExtractResult.SourceId = pSrcId
+		set tExtractResult.SentenceId = pSentId
+		set tExtractResult.RuleDefinition = $this
+		set tExtractResult.MeetsMandatory = 1
+		set tExtractResult.MeetsOrder = 1
+		
+		// prepare matches
+		kill tMatches
+		if pSentId && 'vSrcId {
+			set tSC = ##class(%iKnow.Matching.MatchingAPI).GetMatchesBySentence(.tResult, ..DomainId, pSentId,, 0, 0)
+			quit:$$$ISERR(tSC)
+		} else {
+			set tSC = ##class(%iKnow.Matching.MatchingAPI).GetMatchesBySourceId(.tResult, ..DomainId, pSrcId,, 0, 0)
+			quit:$$$ISERR(tSC)
+		}
+		set i = ""
+		for {
+			set i = $order(tResult(i), 1, tData)
+			quit:i=""
+			set tDictId = $lg(tData,2), tItemId = $lg(tData,3), tMatchId = $lg(tData,1)
+			set tScore = $lg(tData,8)
+			
+			// manual pruning as GetMatchBySentence() didn't cover virtual sources
+			continue:vSrcId&&pSentId&&(pSentId'=$$GetSentId(tData))
+			
+			set tMatches("dictionary", -tScore, tDictId, tMatchId) = tData
+			set tMatches("item", -tScore, tItemId, tMatchId) = tData
+		}
+		
+
+		// go through elements
+		set tLowestCurrentEntOccId = 0
+		for i = 1:1:..Elements.Count() {
+			set tElement = ..Elements.GetAt(i)
+			set tColor = $li(tColors, (i # $ll(tColors))+1)
+			
+			// prepare markup
+			if tElement.Type = "item" {
+				set tTypeId = ##class(%iKnow.Matching.DictionaryAPI).GetDictionaryItemIdByURI(..DomainId, tElement.Name)
+				if 'tTypeId { set tSC = $$$ERROR($$$GeneralError, "Unknown item URI: '"_tElement.Name_"'") quit }
+				
+				set tElementTitle = $zconvert(##class(%iKnow.Objects.DictionaryItem).PKINDEXOpen(..DomainId, tTypeId).Name, "O", "HTML")
+				set tMarkup("MATCHITEM",tTypeId) = "<span style='border:2px solid "_tColor_"; border-radius: 4px; padding-left:2px; padding-right:2px;' title='"_tElementTitle_"'>"
+				set tMarkup("MATCHITEM",tTypeId,"FULL") = "<span style='background-color:"_tColor_"; border:2px solid "_tColor_"; border-radius: 4px; padding-left:2px; padding-right:2px;' title='"_tElementTitle_"'>"
+				
+			} elseif (tElement.Type="dictionary") {
+				
+				set tTypeId = ##class(%iKnow.Matching.DictionaryAPI).GetDictionaryId(..DomainId, tElement.Name)
+				if 'tTypeId { set tSC = $$$ERROR($$$GeneralError, "Unknown element name: '"_tElement.Name_"'") quit }
+				
+				set tElementTitle = $zconvert(tElement.Name, "O", "HTML")
+				set tMarkup("MATCH",tTypeId) = "<span style='border:2px solid "_tColor_"; border-radius: 4px; padding-left:2px; padding-right:2px;' title='"_tElementTitle_"'>"
+				set tMarkup("MATCH",tTypeId,"FULL") = "<span style='background-color:"_tColor_"; border:2px solid "_tColor_"; border-radius: 4px; padding-left:2px; padding-right:2px;' title='"_tElementTitle_"'>"
+			}
+			
+			kill tItemsFound
+			set tSort="", tIsBestMatch=1, tLowestEntOccIdForMatch = -1, tIsMatched=0
+			for {
+				set tSort = $order(tMatches(tElement.Type, tSort))
+				quit:tSort=""
+				
+				set tMatchId=""
+				for {
+					set tMatchId = $order(tMatches(tElement.Type, tSort, tTypeId, tMatchId),1,tData)
+					quit:tMatchId=""
+					
+					set tItemId = $lg(tData,3)
+					continue:$d(tItemsFound(tItemId))&&(tElement.Count<3)
+					set tItemsFound(tItemId) = ""
+					
+					
+					// verify if context is negative/affirmative if required
+					set tIsNegated = ''$lg(tData,15)
+					if (tElement.Negation="negative") { // negation is mandatory
+						continue:'tIsNegated
+					} elseif (tElement.Negation="affirmative") { // negation is prohibited
+						continue:tIsNegated
+					}
+					
+					set tIsMatched = 1
+					
+					// if we're looking at the source level, keep track of the number of sentences
+					// we're spanning
+					if 'pSentId {
+						set tSentId = $$GetSentId(tData)
+						if '$d(tSentencesSpanned(tSentId)) { set tSentencesSpanned(tSentId) = $i(tSentencesSpanned) }
+					}
+					
+					set tExtractElem = ##class(ExtractionResultElement).%New()
+					set tExtractElem.RuleElement = tElement
+					set tExtractElem.RuleElementSeq = i
+					set tExtractElem.DictionaryTermId = $lg(tData,5)
+					set tExtractElem.Negation = tIsNegated
+					set tExtractElem.MatchScore = $lg(tData,8)
+					set tExtractElem.Color = tColor
+					set tExtractElem.IsSecondary = 'tIsBestMatch
+					do tExtractResult.MatchedElements.Insert(tExtractElem)
+					set tTotalScore = tTotalScore + tExtractElem.MatchScore
+					
+					// go through matched entity occurrences
+					set tSC = ##class(%iKnow.Matching.MatchingAPI).GetMatchElements(.tResult, ..DomainId, tMatchId, vSrcId)
+					quit:$$$ISERR(tSC)
+					set j = "", tLiteral = ""
+					for {
+						set j = $order(tResult(j), 1, tData)
+						quit:j=""
+						set tEntOccId = $lg(tData,2), tOutput = $lg(tData,11)
+						set tLiteral = tLiteral _ $s(tLiteral="":"", 1:" ~ ") _ $lg(tData,4)
+						do tExtractElem.EntOccOutput.SetAt(tOutput, tEntOccId)
+						set:(tLowestEntOccIdForMatch<0)||(tLowestEntOccIdForMatch>tEntOccId) tLowestEntOccIdForMatch = tEntOccId
+					}
+					set tExtractElem.Literal = tLiteral
+					set tExtractElem.FirstEntOccId = $lg(tResult(1),2)
+				}
+				quit:$$$ISERR(tSC)
+				
+				set:$d(tMatches(tElement.Type, tSort, tTypeId)) tIsBestMatch = 0
+			}
+			quit:$$$ISERR(tSC)
+			
+			// punish if mandatory element is not matched
+			if (tElement.Count && 'tIsMatched) {
+				set tExtractResult.MeetsMandatory = 0
+			}
+			
+			// verify order
+			if (tLowestCurrentEntOccId > tLowestEntOccIdForMatch) {
+				set tExtractResult.MeetsOrder = 0
+			}
+			set tLowestCurrentEntOccId = tLowestEntOccIdForMatch
+		}
+		quit:$$$ISERR(tSC)
+		
+		
+		// null score if not all mandatory items are found or order is not enforced
+		if (..EnforceSequence && 'tExtractResult.MeetsOrder) || 'tExtractResult.MeetsMandatory {
+			set tExtractResult.Score = 0
+		} else {
+			set tExtractResult.Score = tTotalScore
+		}
+		
+		
+		// process sentence span info 
+		if 'pSentId {
+			// divide score by the square root of the number of sentences the rule spans
+			set tExtractResult.Score = tExtractResult.Score / $zsqr($g(tSentencesSpanned,1))
+		} else {
+			// if this is a match at just the sentence level, half the source-level match as this
+			// one's probably preferable
+			set tID = ..%Id()
+			&SQL(UPDATE Demo_RulesBuilder.ExtractionResult SET Score = Score / 2 WHERE DomainId = :i%DomainId AND DocumentName = :tDocName AND RuleDefinition = :tID AND SourceId = :pSrcId AND SentenceId = 0)
+		}
+		
+		
+		set tMarkup("ATTRIBUTE",$$$IKATTNEGATION) = "<font style='color: DarkRed;'>"
+		//set tMarkup("ROLE", $$$ENTTYPECONCEPT) = "<b>"
+		//set tMarkup("ROLE", $$$ENTTYPERELATION) = "<u>"
+		//set tMarkup("ROLE", $$$ENTTYPENONREL) = "<font style='color: #555555;'>"
+		if pParagraphId {
+			set tExtractResult.HighlightingResult = ##class(Paragraph).%OpenId(pParagraphId).FormatText(..DomainId, .tMarkup, -1)
+		} elseif pSentId {
+			set tExtractResult.HighlightingResult = ##class(%iKnow.Queries.SentenceAPI).GetHighlighted(..DomainId, pSentId, .tMarkup, vSrcId)
+		}
+		set tSC = tExtractResult.%Save()
+		quit:$$$ISERR(tSC)
+		
+		
+		// if we spanned multiple sentences, let's try to find rule matches at the sentence level
+		if $g(tSentencesSpanned)>1 {
+			set tSentId = ""
+			for {
+				set tSentId = $order(tSentencesSpanned(tSentId))
+				quit:tSentId=""
+				
+				set tSC = ..CheckMatches(pSrcId, pParagraphId, tSentId)
+				quit:$$$ISERR(tSC)
+			}
+		}
+		
+	} catch (ex) {
+		set tSC = ex.AsStatus()
+	}
+	quit tSC
+	
+GetSentId(tData) 
+
+	if (pSrcId > 0) {
+		quit ##class(%iKnow.Matching.MatchingAPI).GetSentenceIdForMatchTarget(..DomainId, $lg(tData,6), $lg(tData,7))
+	} else {
+		// helper method doesn't support virtual sources yet!
+		if ($lg(tData,6) = $$$DMTARGETENTITY) {
+			quit ##class(%iKnow.Objects.VirtualEntityOccurrence).PKINDEXOpen(..DomainId, $zabs(pSrcId), $lg(tData,7)).SentenceId
+		} elseif ($lg(tData,6) = $$$DMTARGETCRC) {
+			quit ##class(%iKnow.Objects.VirtualCrcOccurrence).PKINDEXOpen(..DomainId, $zabs(pSrcId), $lg(tData,7)).SentenceId
+		} elseif ($lg(tData,6) = $$$DMTARGETPATH) {
+			set x = $order(^ISC.IKV.PathToSent(..DomainId, $zabs(pSrcId), $lg(tData,7)),-1,tSentBatch)
+			quit $lg(tSentBatch,1)
+		} elseif ($lg(tData,6) = $$$DMTARGETSENT) {
+			quit $lg(tData,7)
+		}
+	}
+}
+
+Storage Default
+{
+<Data name="Elements">
+<Attribute>Elements</Attribute>
+<Structure>subnode</Structure>
+<Subscript>"Elements"</Subscript>
+</Data>
+<Data name="RuleDefinitionDefaultData">
+<Value name="1">
+<Value>%%CLASSNAME</Value>
+</Value>
+<Value name="2">
+<Value>DomainId</Value>
+</Value>
+<Value name="3">
+<Value>Name</Value>
+</Value>
+<Value name="4">
+<Value>EnforceSequence</Value>
+</Value>
+<Value name="5">
+<Value>MinimumScore</Value>
+</Value>
+</Data>
+<DataLocation>^Demo.RulesBB860.RuleDefinitionD</DataLocation>
+<DefaultData>RuleDefinitionDefaultData</DefaultData>
+<IdLocation>^Demo.RulesBB860.RuleDefinitionD</IdLocation>
+<IndexLocation>^Demo.RulesBB860.RuleDefinitionI</IndexLocation>
+<StreamLocation>^Demo.RulesBB860.RuleDefinitionS</StreamLocation>
+<Type>%Library.CacheStorage</Type>
+}
+
+}
+
